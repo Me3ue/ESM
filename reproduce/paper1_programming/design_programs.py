@@ -917,7 +917,82 @@ def parse_args(argv=None):
     p.add_argument("--dry-run", action="store_true", help="只打印计划")
     p.add_argument("--list-tasks", action="store_true")
     p.add_argument("--check", action="store_true")
+    # ---- 多卡分片（配合 lib/multigpu.sh 的 run_on_gpus）
+    p.add_argument("--shard", type=int, default=0,
+                   help="本进程负责第几个分片（从 0 开始）。多卡时由 multigpu.sh 注入")
+    p.add_argument("--shard-total", type=int, default=1,
+                   help="分片总数（= 并行 worker 数）。工作按 (spec, seed) 扁平列表取模切分，"
+                        "保证各分片不重不漏")
+    # ---- 显存相关
+    p.add_argument("--chunk-size", type=int,
+                   default=int(os.environ.get("ESMFOLD_CHUNK", "0")) or None,
+                   help="ESMFold 轴向注意力的分块大小。序列长度 ≤ 该值时不切块（最快）。"
+                        "A6000 48GB 建议 512；显存紧张就往下降。默认读环境变量 ESMFOLD_CHUNK")
+    p.add_argument("--oom-retry", type=int, default=3,
+                   help="显存不足时自动减小分块并重试的次数（共享机器上很有用）")
     return p.parse_args(argv)
+
+
+# ==========================================================================
+# 显存自适应：OOM 时自动降分块并重试
+# ==========================================================================
+class OomRetryFolder:
+    """包一层 ESMFold 回调：捕获 CUDA OOM → 清缓存、把分块减半、重试。
+
+    为什么需要：这台机器是共享的（别人的进程可能随时占卡），
+    固定一个分块大小会在显存被挤压时整条跑动失败。
+    """
+
+    def __init__(self, callback, chunk_size=None, tries=3, min_chunk=64):
+        self._cb = callback
+        self.chunk = chunk_size
+        self.tries = max(0, tries)
+        self.min_chunk = min_chunk
+        self.oom_count = 0
+
+    def __getattr__(self, item):          # 透传 model 等属性
+        return getattr(self._cb, item)
+
+    def fold(self, sequence, residue_indices):
+        import torch
+
+        last_exc = None
+        for attempt in range(self.tries + 1):
+            try:
+                return self._cb.fold(sequence, residue_indices)
+            except torch.cuda.OutOfMemoryError as exc:   # type: ignore[attr-defined]
+                last_exc = exc
+                self.oom_count += 1
+                torch.cuda.empty_cache()
+                new_chunk = max(self.min_chunk, (self.chunk or 512) // 2)
+                if new_chunk == self.chunk:
+                    raise
+                self.chunk = new_chunk
+                try:
+                    self._cb.model.set_chunk_size(self.chunk)
+                except Exception:
+                    pass
+                print(f"      [显存不足] 已把 ESMFold 分块降到 {self.chunk}，重试 "
+                      f"{attempt + 1}/{self.tries}（第 {self.oom_count} 次 OOM）", flush=True)
+        raise last_exc  # type: ignore[misc]
+
+
+def resolve_device(requested: str) -> str:
+    """auto/cuda/cuda:N → 可用的设备串。
+
+    * "auto"  → torch 能看到 CUDA 就用 cuda:0，否则 cpu
+    * "cuda"  → cuda:0（多卡 worker 里配合 CUDA_VISIBLE_DEVICES 用）
+    """
+    if requested in ("auto", ""):
+        try:
+            import torch
+
+            return "cuda:0" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    if requested == "cuda":
+        return "cuda:0"
+    return requested
 
 
 def main(argv=None) -> int:
@@ -936,12 +1011,22 @@ def main(argv=None) -> int:
     specs = spec_grid(args.task, args.grid, args)
     total_runs = sum(s.seeds for s in specs)
 
+    # ---- 扁平化工作列表 + 分片（各分片合起来 = 全部工作，且互不重叠）
+    work = [(spec, seed) for spec in specs for seed in range(spec.seeds)]
+    if args.shard_total > 1:
+        if not (0 <= args.shard < args.shard_total):
+            print(f"[错误] --shard 必须在 [0, {args.shard_total}) 内，当前 {args.shard}")
+            return 2
+        work = [w for i, w in enumerate(work) if i % args.shard_total == args.shard]
+
     print("=" * 78)
     print(f"任务      : {args.task}  ({TASKS[args.task]['figure']})")
     print(f"论文位置  : {TASKS[args.task]['desc']}")
     print(f"网格      : {args.grid}   步数/跑动: {steps}   seed 合计: {total_runs}")
     print(f"权重口径  : {args.weights}")
     print(f"输出目录  : {args.out_dir}")
+    if args.shard_total > 1:
+        print(f"分片      : 第 {args.shard}/{args.shard_total} 片，本进程负责 {len(work)} 条跑动")
     print("=" * 78)
     for s in specs[:12]:
         print(f"  spec={s.name:<20} seeds={s.seeds:<5} kwargs={s.kwargs}")
@@ -949,23 +1034,16 @@ def main(argv=None) -> int:
         print(f"  ... 其余 {len(specs) - 12} 个 spec 略")
     print("-" * 78)
     if args.grid == "paper" and steps >= 30000:
-        print("提示：论文规模下总折叠次数 ≈ seed 数 × 30000，请在 GPU 上分段跑。")
+        print(f"提示：本进程 {len(work)} 条跑动 × {steps} 步 = {len(work) * steps:,} 次 ESMFold。")
 
     if args.dry_run:
         print("[dry-run] 不执行。去掉 --dry-run 即开始。")
         return 0
 
-    # ---- 依赖检查 + 加载 ESMFold
+    # ---- 加载 ESMFold（并设置分块大小）
     from language import EsmFoldv1
 
-    device = args.device
-    if device == "auto":
-        try:
-            import torch
-
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            device = "cpu"
+    device = resolve_device(args.device)
     print(f"[设备] {device}")
     if device == "cpu":
         print("[警告] CPU 模式下 ESMFold 极慢；MODE=smoke 也会很慢。")
@@ -973,37 +1051,47 @@ def main(argv=None) -> int:
     print("[1/2] 加载 ESMFold v1 ...")
     callback = EsmFoldv1()
     callback.load(device=device)
+    if args.chunk_size and device.startswith("cuda"):
+        try:
+            callback.model.set_chunk_size(int(args.chunk_size))
+            print(f"[分块] ESMFold chunk_size={args.chunk_size}"
+                  f"（序列长 ≤ 该值时一次算完，不切块）")
+        except Exception as exc:
+            print(f"[警告] 设置 chunk_size 失败：{exc!r}")
+    folder = OomRetryFolder(callback, chunk_size=args.chunk_size or 512, tries=args.oom_retry)
 
     # ---- 逐条跑
     done = skipped = failed = 0
-    for spec in specs:
-        for seed in range(spec.seeds):
-            d = args.out_dir / args.task / spec.name / f"seed{seed}"
-            if not args.no_skip_done and (d / "design.fasta").exists():
-                skipped += 1
-                continue
-            try:
-                print(f"[2/2] {args.task}/{spec.name}/seed{seed} ...", flush=True)
-                res, atoms = run_one(args.task, spec, seed, args.out_dir, args, callback, steps)
-                save_result(res, args.out_dir, atoms=atoms)
-                done += 1
-                print(f"      → pLDDT={res.plddt:.3f} pTM={res.ptm:.3f} "
-                      f"E={res.energy:.3f}  ({res.seconds:.1f}s)")
-            except KeyboardInterrupt:
-                print("\n[中断] 已完成的跑动都已落盘，重跑本命令即可续跑。")
-                return 130
-            except Exception as exc:
-                failed += 1
-                d.mkdir(parents=True, exist_ok=True)
-                (d / "status.json").write_text(
-                    json.dumps({"state": "failed", "error": repr(exc)}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                (d / "traceback.txt").write_text(traceback.format_exc(), encoding="utf-8")
-                print(f"      ! 失败：{exc!r}（已记录到 {d}/traceback.txt）")
+    for n, (spec, seed) in enumerate(work, start=1):
+        d = args.out_dir / args.task / spec.name / f"seed{seed}"
+        if not args.no_skip_done and (d / "design.fasta").exists():
+            skipped += 1
+            continue
+        try:
+            print(f"[2/2] ({n}/{len(work)}) {args.task}/{spec.name}/seed{seed} ...", flush=True)
+            res, atoms = run_one(args.task, spec, seed, args.out_dir, args, folder, steps)
+            save_result(res, args.out_dir, atoms=atoms)
+            done += 1
+            print(f"      → pLDDT={res.plddt:.3f} pTM={res.ptm:.3f} "
+                  f"E={res.energy:.3f}  ({res.seconds:.1f}s)")
+        except KeyboardInterrupt:
+            print("\n[中断] 已完成的跑动都已落盘，重跑本命令即可续跑。")
+            return 130
+        except Exception as exc:
+            failed += 1
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "status.json").write_text(
+                json.dumps({"state": "failed", "error": repr(exc)}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (d / "traceback.txt").write_text(traceback.format_exc(), encoding="utf-8")
+            print(f"      ! 失败：{exc!r}（已记录到 {d}/traceback.txt）")
 
     print("=" * 78)
     print(f"完成 {done} 条，跳过 {skipped} 条（已存在），失败 {failed} 条")
+    if folder.oom_count:
+        print(f"本次遇到 {folder.oom_count} 次显存不足（已自动降分块重试）；"
+              f"最终分块 = {folder.chunk}")
     print(f"产物：{args.out_dir / args.task}")
     print("下一步：python aggregate_p1.py --root", args.out_dir)
     print("=" * 78)

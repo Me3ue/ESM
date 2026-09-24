@@ -1,7 +1,9 @@
 # 两篇论文的复现工具包
 
 > **想直接看「怎么跑」和「论文用了多少机器」？** → 看 **[`RUNBOOK.md`](RUNBOOK.md)**
-> （环境无关版：标准环境安装、逐实验命令、论文原文的设备与规模、算力预算与分期排期）。
+> （标准环境安装、逐实验命令、论文原文的设备与规模、算力预算与分期排期）。
+> **换机器 / 多卡并行 / 显存调参**？ → 看 **[`MACHINE.md`](MACHINE.md)**
+> （硬件自动探测、进程级分片、A6000 参数、共享机器避让）。
 > 本 README 主要讲工具包的设计、与论文不一致之处、以及本机现状的排错。
 
 覆盖仓库 `examples/` 下两篇论文的实验：
@@ -277,7 +279,7 @@ $PY aggregate_p2.py --root ../outputs/p2
 
 | 脚本 | 作用 |
 |:--|:--|
-| `00_setup_env.sh {check,base,esmfold,extern,all}` | 环境准备与体检 |
+| **`00_setup_env.sh {hardware [--write],check,base,cuda,esmfold,extern,all}`** | **硬件探测 / 依赖 / CUDA torch**（先跑 `hardware --write`） |
 | **`fetch_datasets.sh {plan,core,pdb,weights,paperdata,seqdb,afdb,pdb-snapshot,processing,verify}`** | **数据集获取与组织**，详见 [`DATASETS.md`](DATASETS.md) |
 | `run_all.sh` | 顶层：论文一 + 论文二 + 公开数据复算 + 总汇总 |
 | `paper1_programming/run_p1.sh` | 论文一全部设计任务 + roundtrip + 汇总 |
@@ -285,7 +287,10 @@ $PY aggregate_p2.py --root ../outputs/p2
 | `aggregate_all.py` | 总汇总 → `outputs/REPRO_SUMMARY.md` |
 
 ```bash
-# 数据集（先做这个）
+# 让脚本认识你的机器（先做这个）
+bash 00_setup_env.sh hardware --write   # 探测硬件 → 生成 machine.env
+
+# 数据集
 bash fetch_datasets.sh plan     # 看清单
 bash fetch_datasets.sh core     # 必需部分 ≈ 8.8 GB
 bash fetch_datasets.sh verify   # 校验
@@ -322,10 +327,14 @@ ONLY=p2 MODE=smoke NOVELTY_DB=/data/uniref90.fasta bash run_all.sh
 ```
 reproduce/
 ├── RUNBOOK.md                     ★ 环境无关的运行手册（安装 / 逐实验命令 / 论文设备与规模 / 排期）
+├── MACHINE.md                     ★ 设备适配（硬件探测 / 多卡分片 / 显存调参 / 共享机器避让）
 ├── DATASETS.md                    ★ 数据集获取与组织（来源 / 体积 / 目录规范 / 校验 / 踩坑）
 ├── README.md                      ← 本文件
-├── 00_setup_env.sh                环境准备/体检
+├── machine.env                    （生成物）机器档案，被所有脚本自动加载
+├── 00_setup_env.sh                环境准备/体检/硬件探测/CUDA 安装
 ├── fetch_datasets.sh              数据集下载/清洗/校验
+├── lib/hardware.sh                硬件探测 + 自动调参 + 机器档案
+├── lib/multigpu.sh                多卡分片调度
 ├── requirements-repro.txt         额外 pip 依赖
 ├── run_all.sh                     顶层一键
 ├── aggregate_all.py               总汇总

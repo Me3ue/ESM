@@ -36,3 +36,10 @@ nmf/outputs/
 *.log
 *~
 data/raw/swissprot_reviewed.fasta
+data/raw/swissprot_reviewed.fasta
+
+# 论文复现工具包（reproduce/）的产物与机器相关文件
+reproduce/outputs/
+reproduce/machine.env
+reproduce/.repro_tmp/
+reproduce/logs/

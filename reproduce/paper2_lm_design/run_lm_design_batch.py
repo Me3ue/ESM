@@ -179,9 +179,13 @@ def lm_perplexity(des) -> Optional[float]:
 _ESMFOLD_CACHE: Dict[str, Any] = {}
 
 
-def oracle_esmfold(sequence: str, target_pdb: Optional[Path], device: str) -> Dict[str, Any]:
+def oracle_esmfold(sequence: str, target_pdb: Optional[Path], device: str,
+                   max_seq_len: int = 1022) -> Dict[str, Any]:
     """用 ESMFold 代替论文的 AlphaFold oracle（数值不可直接对比，仅作相对参考）。"""
     out: Dict[str, Any] = {}
+    if len(sequence) > max_seq_len:
+        out["oracle_skipped"] = f"length {len(sequence)} > --max-seq-len {max_seq_len}"
+        return out
     try:
         import torch
 
@@ -189,10 +193,23 @@ def oracle_esmfold(sequence: str, target_pdb: Optional[Path], device: str) -> Di
 
         if "model" not in _ESMFOLD_CACHE:
             _ESMFOLD_CACHE["model"] = esm.pretrained.esmfold_v1().eval().to(device)
+            chunk = os.environ.get("ESMFOLD_CHUNK")
+            if chunk:
+                try:
+                    _ESMFOLD_CACHE["model"].set_chunk_size(int(chunk))
+                except Exception:
+                    pass
         model = _ESMFOLD_CACHE["model"]
 
-        with torch.no_grad():
-            out["esmfold_pdb"] = model.infer_pdb(sequence)
+        try:
+            with torch.no_grad():
+                out["esmfold_pdb"] = model.infer_pdb(sequence)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            model.set_chunk_size(128)
+            out["oracle_note"] = "OOM：已把 ESMFold 分块降到 128 后重试"
+            with torch.no_grad():
+                out["esmfold_pdb"] = model.infer_pdb(sequence)
         out["oracle"] = "esmfold"
         if target_pdb and target_pdb.exists():
             import io
@@ -283,7 +300,8 @@ def run_seed(task: str, tag: str, seed: int, args, out_dir: Path) -> Dict[str, A
         "overrides": overrides,
     }
     if args.oracle == "esmfold":
-        metrics.update(oracle_esmfold(seq, args.pdb_path if task == "fixedbb" else None, args.device))
+        metrics.update(oracle_esmfold(seq, args.pdb_path if task == "fixedbb" else None,
+                                     args.device, args.max_seq_len))
     return metrics, traj
 
 
@@ -326,6 +344,13 @@ def main() -> int:
                     help="下载论文 App A.1.1 的 39 个 de novo target 后退出")
     ap.add_argument("--check", action="store_true", help="依赖体检后退出")
     ap.add_argument("--dry-run", action="store_true")
+    # ---- 多卡分片（配合 lib/multigpu.sh 的 run_on_gpus）
+    ap.add_argument("--shard", type=int, default=0,
+                    help="本进程负责第几个分片（从 0 开始）。多卡时由 multigpu.sh 注入")
+    ap.add_argument("--shard-total", type=int, default=1,
+                    help="分片总数（= 并行 worker 数）。按 seed 取模切分，各分片不重不漏")
+    ap.add_argument("--max-seq-len", type=int, default=1022,
+                    help="超过该长度的设计在 oracle 折叠时跳过（避免显存溢出）")
     args = ap.parse_args()
 
     if args.check:
@@ -333,18 +358,31 @@ def main() -> int:
     if args.fetch_pdbs:
         return fetch_pdbs(args.pdb_dir, DE_NOVO_TARGETS)
 
+    # 设备归一化：multigpu.sh 的 worker 里传 "cuda"，配合 CUDA_VISIBLE_DEVICES 使用
+    if args.device == "cuda":
+        args.device = "cuda:0"
+
     if args.num_iter is None:
         args.num_iter = 170000
 
     seeds = parse_seeds(args.seeds)
+    total_seeds = len(seeds)
+    if args.shard_total > 1:
+        if not (0 <= args.shard < args.shard_total):
+            log(f"[错误] --shard 必须在 [0, {args.shard_total}) 内，当前 {args.shard}")
+            return 2
+        seeds = [s for i, s in enumerate(seeds) if i % args.shard_total == args.shard]
+
     tag = args.pdb.lower() if args.task == "fixedbb" else f"L{args.length}"
     args.pdb_path = (args.pdb_dir / f"{args.pdb}.pdb").resolve() if args.task == "fixedbb" else None
 
     log("=" * 78)
-    log(f"论文二 {args.task}  tag={tag}  seeds={len(seeds)}  num_iter={args.num_iter}")
+    log(f"论文二 {args.task}  tag={tag}  seeds={total_seeds}  num_iter={args.num_iter}")
     log(f"oracle   : {args.oracle}")
     log(f"设备     : {args.device}")
     log(f"输出目录 : {args.out_dir}")
+    if args.shard_total > 1:
+        log(f"分片     : 第 {args.shard}/{args.shard_total} 片，本进程负责 {len(seeds)} 条")
     if args.task == "fixedbb":
         log(f"target   : {args.pdb_path}  （存在={bool(args.pdb_path and args.pdb_path.exists())}）")
         if not (args.pdb_path and args.pdb_path.exists()):
@@ -353,12 +391,15 @@ def main() -> int:
             return 2
     else:
         log(f"生成长度 : {args.length}")
-    log(f"预计单条耗时：论文规模下 ~10 小时/条（L≈100，32GB V100），共 {len(seeds)} 条")
+    log(f"预计单条耗时：论文规模下 ~10 小时/条（L≈100，32GB V100）；"
+        f"A6000 48GB 通常更快。本进程 {len(seeds)} 条")
     log("=" * 78)
 
     if args.dry_run:
-        for s in seeds:
+        for s in seeds[:20]:
             log(f"  [dry-run] seed={s} → {args.out_dir / args.task / tag / f'seed{s}'}")
+        if len(seeds) > 20:
+            log(f"  ... 其余 {len(seeds) - 20} 个 seed 略")
         return 0
 
     # lm_design.py 强制要求 cwd 是 examples/lm-design，且要从那里 import utils

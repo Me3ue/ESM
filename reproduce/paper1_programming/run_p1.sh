@@ -25,7 +25,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HERE/../lib/common.sh"
+source "$HERE/../lib/common.sh"   # 已内含 lib/multigpu.sh
 
 P1_OUT="$OUT_ROOT/p1"
 MODE="${MODE:-smoke}"
@@ -75,22 +75,41 @@ if [[ "$MODE" == "full" ]] && ! python_has openfold; then
   [[ "$DRY_RUN" == "1" ]] || exit 3
 fi
 
-mkdir -p "$P1_OUT"
+mkdir -p "$P1_OUT" "$P1_OUT/logs"
+
+# ---- 多卡：挑出空闲卡，每张卡一个 worker，各自跑一个不重叠的工作分片
+hw_probe; hw_auto_tune
+GPU_LIST="${GPUS:-$(hw_free_gpus || true)}"
+WORKER_DEVICE="cuda:0"                              # worker 内 CUDA_VISIBLE_DEVICES 已重映射
+if [[ "$DEVICE" == "cpu" || -z "$GPU_LIST" ]]; then WORKER_DEVICE="cpu"; GPU_LIST=""; fi
+N_SHARDS=$([[ -n "$GPU_LIST" ]] && awk -F, '{print NF}' <<< "$GPU_LIST" || echo 1)
+
+log "解释器    : $PY"
+log "设备      : $DEVICE（worker 内用 $WORKER_DEVICE）"
+log "参与并行的卡: ${GPU_LIST:-无（单进程）}   分片数 $N_SHARDS"
+log "ESMFold 分块: $ESMFOLD_CHUNK"
+log "产物根目录: $P1_OUT"
+log "任务      : ${RUN_TASKS[*]}"
+log "权重口径  : $WEIGHTS"
+[[ "$DRY_RUN" == "1" ]] && warn "DRY_RUN=1：只打印，不会执行任何训练"
+multigpu_plan
 
 # ---------------------------------------------------------------- 1) 设计实验
-banner "阶段 1/3：设计实验（模拟退火 + ESMFold）"
+banner "阶段 1/3：设计实验（模拟退火 + ESMFold，多卡分片）"
 for task in "${RUN_TASKS[@]}"; do
-  log "▶ $task"
-  run_timed "$task" \
+  log "▶ $task  （$N_SHARDS 个分片并行）"
+  run_on_gpus --gpus "$GPU_LIST" --log-dir "$P1_OUT/logs" -- \
     "$PY" "$HERE/design_programs.py" \
       --task "$task" \
       --grid "$GRID" \
       --steps "$STEPS" \
       --weights "$WEIGHTS" \
-      --device "$DEVICE" \
+      --device "$WORKER_DEVICE" \
+      --chunk-size "$ESMFOLD_CHUNK" \
+      --shard "{SHARD}" --shard-total "{NSHARD}" \
       --out-dir "$P1_OUT" \
       ${SEEDS:+--seeds "$SEEDS"} \
-      || warn "$task 有失败条目（已记录 traceback，可重跑续跑）"
+    || warn "$task 有失败条目（日志在 $P1_OUT/logs，重跑同一命令可续跑）"
 done
 
 # ---------------------------------------------------------------- 2) roundtrip
@@ -109,7 +128,7 @@ if [[ "${WITH_ROUNDTRIP:-0}" == "1" ]]; then
     || warn "roundtrip 未完成（可重跑，会自动续跑）"
 else
   log "跳过逆折叠 roundtrip（想跑就加 WITH_ROUNDTRIP=1）"
-  dim "  它需要 ESM-IF1 权重（约 1.4GB）+ 每结构 10 次 ESMFold，非常耗时。"
+  dim "  它需要 ESM-IF1 权重（1.6 GB）+ 每结构 10 次 ESMFold，非常耗时。"
 fi
 
 # ---------------------------------------------------------------- 3) 汇总

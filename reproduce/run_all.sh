@@ -33,14 +33,20 @@ log "产物  ：$OUT_ROOT"
 dim  "论文一：A high-level programming language for generative protein design"
 dim  "论文二：Language models generalize beyond natural proteins"
 
-# ---------------------------------------------------------------- 0) 体检
-banner "阶段 0：环境体检"
-run "$PY" "$HERE/aggregate_all.py" --help >/dev/null 2>&1 || true
+# ---------------------------------------------------------------- 0) 硬件 + 体检
+banner "阶段 0：硬件探测与环境体检"
+hw_report
+if [[ "$HW_GPU_COUNT" -gt 0 && "$DEVICE" == "cpu" ]]; then
+  warn "检测到 $HW_GPU_COUNT 张物理 GPU，但当前解释器的 torch 看不到 CUDA。"
+  warn "  → 论文规模所需的 GPU 加速不可用。修复：bash $HERE/00_setup_env.sh cuda"
+  warn "  → 若本机有两个环境（论文一 ESMFold / 论文二 lm-design），用 machine.env 指定 PY。"
+fi
 python_has torch || warn "torch 缺失"
 python_has esm   || warn "esm 缺失（本仓库需要 pip install -e .）"
 python_has openfold || warn "openfold 缺失 → 论文一的 ESMFold 设计实验无法运行"
 python_has hydra    || warn "hydra 缺失 → 论文二的 lm-design 无法运行"
 dim "  （论文二公开数据复算不需要上面任何模型，永远可跑。）"
+multigpu_plan
 
 # ---------------------------------------------------------------- 0.5) 数据集
 if [[ "${SKIP_DATA:-0}" != "1" ]]; then

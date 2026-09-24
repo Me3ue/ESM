@@ -10,6 +10,7 @@
 | 文档 | 内容 |
 |:--|:--|
 | **本文（RUNBOOK.md）** | 环境安装 → 逐实验命令 → 论文的设备与规模 → 算力推算 → 分期排期 |
+| [`MACHINE.md`](MACHINE.md) | **设备适配**：硬件自动探测、多卡分片并行、按显存调参、共享机器注意事项 |
 | [`DATASETS.md`](DATASETS.md) | 数据集：从哪下、多大、放哪、怎么组织、怎么校验、踩坑清单 |
 | [`README.md`](README.md) | 工具包设计、与论文不一致之处、本机排错 |
 | [`outputs/p2/paper_data_report/PAPER_DATA_REPORT.md`](outputs/p2/paper_data_report/PAPER_DATA_REPORT.md) | 论文二公开实验数据的逐项复算（7/8 项精确命中） |
@@ -27,6 +28,19 @@
 | Python | **两个环境**：论文二用 3.10；论文一（ESMFold/OpenFold）建议单独建 **3.9** 环境 |
 | 磁盘 | 起步 **150 GB**；要复现序列新颖性给 **300 GB**；要 TM-score 穷举或重训投影层给 **1 TB**。明细见 [`DATASETS.md` §4](DATASETS.md) |
 | 外部工具 | `jackhmmer` 3.3.2、`TM-align` ≥20210107、`Foldseek`、`Rosetta`（过滤指标）、`aria2/wget` |
+
+### 1.1.1 先让脚本认识你的机器（重要）
+
+所有脚本都会**自动探测硬件**并按结果调参（设备、并行度、ESMFold 分块、jackhmmer 线程、TMPDIR）。
+把结论固化成档案只做一次：
+
+```bash
+bash reproduce/00_setup_env.sh hardware          # 打印硬件报告 + 自动调参结果
+bash reproduce/00_setup_env.sh hardware --write  # 写成 reproduce/machine.env，后续脚本自动加载
+```
+
+`machine.env` 里全是 `${VAR:-默认}` 形式，**命令行显式传的环境变量永远优先**，改设备/并行数直接编辑它即可。
+多卡怎么分片、共享机器怎么避让、A6000 上调了哪些参数，见 **[`MACHINE.md`](MACHINE.md)**。
 
 **数据获取与组织**：见 **[`DATASETS.md`](DATASETS.md)**——每份数据从哪下、多大、怎么放、怎么校验、
 有哪些坑。一键入口：
@@ -46,7 +60,8 @@ conda create -y -n esm python=3.10 pip
 conda activate esm
 pip install torch --index-url https://download.pytorch.org/whl/cu124
 cd /path/to/esm && pip install -e .
-pip install -r reproduce/requirements-repro.txt     # biotite/rich/hydra/omegaconf/nltk/pandas/scipy
+bash reproduce/00_setup_env.sh base                 # biotite/rich/hydra/omegaconf/nltk/pandas/scipy
+bash reproduce/00_setup_env.sh cuda                 # CUDA 版 torch（按驱动自动选 cu12x）
 conda install -y -c bioconda hmmer=3.3.2            # jackhmmer
 conda install -y -c conda-forge aria2 wget
 
@@ -82,6 +97,10 @@ $PY_ESM      reproduce/paper2_lm_design/run_lm_design_batch.py --check
 ## 2. 论文一：逐实验命令
 
 论文一没有 CLI，全部通过 `design_programs.py` 驱动（`--task` 选实验，`--grid paper` 用论文规模）。
+
+**多卡是自动的**：`run_p1.sh` 会挑出空闲卡、每张卡起一个 worker、各自跑一个不重叠的工作分片
+（`--shard/--shard-total`），日志分流到 `<OUT>/logs/`。想手工指定就跑
+`GPUS=0,2,4,5 bash reproduce/paper1_programming/run_p1.sh`；原理与调参见 [`MACHINE.md`](MACHINE.md) §2。
 
 ```bash
 export PY=/path/to/envs/esmfold/bin/python
@@ -133,14 +152,17 @@ $PY design_programs.py --task hierarchical_asymmetric --grid paper \
     --device cuda:0 --out-dir $OUT
 ```
 
-> 多卡并行：脚本按 `task/spec/seed` 分目录、自动跳过已完成项，所以可以直接
-> **开会话多开**，把 `--task` 或 `--seeds` 切片丢给不同 GPU：
+> **手工多卡**（一键脚本已经自动做了，这里只是说明原理）：
+> 用 `--shard I --shard-total N` 把扁平化的 (spec, seed) 列表按下标取模切分，各分片不重不漏：
 > ```bash
-> CUDA_VISIBLE_DEVICES=0 $PY design_programs.py --task functional_site_scaffolding \
->     --seeds 0-249 --out-dir $OUT &
-> CUDA_VISIBLE_DEVICES=1 $PY design_programs.py --task functional_site_scaffolding \
->     --seeds 250-499 --out-dir $OUT &
+> for i in 0 1 2 3; do
+>   CUDA_VISIBLE_DEVICES=$i $PY design_programs.py \
+>       --task functional_site_scaffolding --grid paper \
+>       --shard $i --shard-total 4 --device cuda:0 --out-dir $OUT &
+> done; wait
 > ```
+> `CUDA_VISIBLE_DEVICES` 把物理卡重映射成 `cuda:0`，所以 worker 内统一写 `--device cuda:0`。
+> 中断后重跑同一条命令即可续跑（已完成的单条跑动会被跳过）。
 
 ### 2.2 逆折叠 roundtrip（图 3C-D / 4C-D / S2D）
 
@@ -215,6 +237,10 @@ $PY run_lm_design_batch.py --fetch-pdbs --pdb-dir $OUT/de_novo_targets
 > `data/processed/lm_design_targets/`，多链或含配体的原始 entry 会让 `pdb_loader` 出错。
 
 ### 3.2 固定骨架设计（图 2A-F）
+
+> 多卡同样自动：`run_p2.sh` 会把每个 target 的 seed 列表按空闲卡数分片，
+> 每张卡一个 worker。论文二的 `lm_design.py` 内部写死 `assert num_seqs == 1`，
+> **不能**把多个 seed 塞进一个进程，所以只能进程级分片。
 
 ```bash
 # 论文规模：39 个 target × 200 designs，每条 170,000 步 MCMC

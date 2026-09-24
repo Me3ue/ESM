@@ -27,7 +27,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$HERE/../lib/common.sh"
+source "$HERE/../lib/common.sh"   # 已内含 lib/multigpu.sh
 
 P2_OUT="$OUT_ROOT/p2"
 MODE="${MODE:-smoke}"
@@ -70,7 +70,16 @@ check_python_deps torch esm hydra omegaconf nltk scipy || {
   [[ "$DRY_RUN" == "1" ]] || exit 3
 }
 
-mkdir -p "$P2_OUT" "$PDB_DIR"
+mkdir -p "$P2_OUT" "$PDB_DIR" "$P2_OUT/logs"
+
+# ---- 多卡：挑空闲卡，每张卡一个 worker，各自跑一个不重叠的 seed 分片
+hw_probe; hw_auto_tune
+GPU_LIST="${GPUS:-$(hw_free_gpus || true)}"
+WORKER_DEVICE="cuda:0"                              # worker 内 CUDA_VISIBLE_DEVICES 已重映射
+if [[ "$DEVICE" == "cpu" || -z "$GPU_LIST" ]]; then WORKER_DEVICE="cpu"; GPU_LIST=""; fi
+N_SHARDS=$([[ -n "$GPU_LIST" ]] && awk -F, '{print NF}' <<< "$GPU_LIST" || echo 1)
+log "参与并行的卡: ${GPU_LIST:-无（单进程）}   分片数 $N_SHARDS"
+multigpu_plan
 
 # ---------------------------------------------------------------- 0) 论文公开数据复算（零成本，先做）
 banner "阶段 0/4：复算论文公开实验数据（不加载模型）"
@@ -83,54 +92,60 @@ if [[ "${ALL_TARGETS:-0}" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------- 2) 设计实验
-banner "阶段 2/4：设计实验（lm-design）"
+banner "阶段 2/4：设计实验（lm-design，多卡分片）"
+
+# 一次 target 的固定骨架设计（多卡按 seed 分片）
+run_fixedbb_target() {
+  local pdb="$1" src="$2"
+  log "▶ fixedbb target=$pdb  （$N_SHARDS 个分片并行）"
+  run_on_gpus --gpus "$GPU_LIST" --log-dir "$P2_OUT/logs" -- \
+    "$PY" "$HERE/run_lm_design_batch.py" \
+      --task fixedbb --pdb "$pdb" --pdb-dir "$src" \
+      --seeds "$SEEDS_FIXEDBB" --num-iter "$NUM_ITER" \
+      --oracle "$ORACLE" --device "$WORKER_DEVICE" \
+      --shard "{SHARD}" --shard-total "{NSHARD}" \
+      --out-dir "$P2_OUT" \
+    || warn "target $pdb 有失败 seed（日志在 $P2_OUT/logs，重跑同命令可续跑）"
+}
+
 for task in $TASKS; do
   if [[ "$task" == "fixedbb" ]]; then
-    seeds="$SEEDS_FIXEDBB"
     if [[ -n "$PDBS" ]]; then
-      for pdb in $PDBS; do
-        log "▶ fixedbb target=$pdb"
-        run_timed "fixedbb/$pdb" \
-          "$PY" "$HERE/run_lm_design_batch.py" \
-            --task fixedbb --pdb "$pdb" --pdb-dir "$PDB_SRC" \
-            --seeds "$seeds" --num-iter "$NUM_ITER" \
-            --oracle "$ORACLE" --device "$DEVICE" --out-dir "$P2_OUT" \
-          || warn "target $pdb 有失败 seed（已记录 traceback，可重跑续跑）"
-      done
+      for pdb in $PDBS; do run_fixedbb_target "$pdb" "$PDB_SRC"; done
     else
       log "▶ fixedbb 全部 39 个 de novo target（顺序执行）"
       for pdb in $(ls "$PDB_DIR"/*.pdb 2>/dev/null | xargs -n1 basename | sed 's/\.pdb$//'); do
-        run_timed "fixedbb/$pdb" \
-          "$PY" "$HERE/run_lm_design_batch.py" \
-            --task fixedbb --pdb "$pdb" --pdb-dir "$PDB_DIR" \
-            --seeds "$seeds" --num-iter "$NUM_ITER" \
-            --oracle "$ORACLE" --device "$DEVICE" --out-dir "$P2_OUT" \
-          || warn "target $pdb 有失败 seed"
+        run_fixedbb_target "$pdb" "$PDB_DIR"
       done
     fi
   else
-    log "▶ free_generation length=$FG_LENGTH"
-    run_timed "free_generation" \
+    log "▶ free_generation length=$FG_LENGTH  （$N_SHARDS 个分片并行）"
+    run_on_gpus --gpus "$GPU_LIST" --log-dir "$P2_OUT/logs" -- \
       "$PY" "$HERE/run_lm_design_batch.py" \
         --task free_generation --length "$FG_LENGTH" \
         --seeds "$SEEDS_FG" --num-iter "$NUM_ITER" \
-        --device "$DEVICE" --out-dir "$P2_OUT" \
-      || warn "free_generation 有失败 seed"
+        --device "$WORKER_DEVICE" \
+        --shard "{SHARD}" --shard-total "{NSHARD}" \
+        --out-dir "$P2_OUT" \
+      || warn "free_generation 有失败 seed（日志在 $P2_OUT/logs）"
   fi
 done
 
 # ---------------------------------------------------------------- 3) 序列新颖性
 if [[ -n "${NOVELTY_DB:-}" ]]; then
   banner "阶段 3/4：序列新颖性（jackhmmer，图 2G / 4F-G）"
+  log "jackhmmer 线程数 = $JACKHMMER_CPU（按 $HW_CPU_CORES 核自动定，可用 JACKHMMER_CPU 覆盖）"
   run_timed "novelty" \
     "$PY" "$HERE/analyze_novelty.py" \
       --fasta-dir "$P2_OUT" --db "$NOVELTY_DB" \
       --db-name "${NOVELTY_DB_NAME:-uniref90_2021_04}" \
+      --cpu "$JACKHMMER_CPU" \
       --out "$P2_OUT/novelty" \
     || warn "新颖性检索未完成"
 else
   log "跳过序列新颖性（想跑就设 NOVELTY_DB=<本地序列库 fasta>）"
-  dim "  论文用的是 UniRef90 2021_04（约 15GB）+ 两个 purge 列表，见 analyze_novelty.py 头部说明。"
+  dim "  论文用的是 UniRef90 2021_04（158GB 打包）或当前版（32GB）+ 两个 purge 列表，"
+  dim "  见 DATASETS.md §3.4。本机内存 $((HW_MEM_TOTAL_MB/1024))GB，大库建议放数据盘而不是 /dev/shm。"
 fi
 
 # ---------------------------------------------------------------- 4) 汇总
