@@ -1,0 +1,26 @@
+# 复现两篇论文所需的额外 Python 依赖（pip 安装）
+#
+# 说明：
+#  * fair-esm 本体已通过 `pip install -e .` 装在 conda 环境 ESM 中，这里只列额外项。
+#  * ESMFold 的 OpenFold 依赖无法只靠 pip 装好（需要 CUDA 工具链/nvcc），
+#    见 00_setup_env.sh 的 `esmfold` 分支。
+
+# --- 论文一：protein-programming-language 直接依赖 -------------------------
+biotite>=0.35.0        # P-SEA 二级结构注释、Shrake-Rupley SASA、Kabsch 叠合
+rich                   # language/optimize.py 的进度表格
+
+# --- 论文二：lm-design 直接依赖 --------------------------------------------
+hydra-core>=1.1
+omegaconf>=2.1
+nltk                   # n-gram 先验
+py3Dmol                # notebook 可视化（可选）
+
+# --- 数据分析 / 汇总（本工具包自带脚本依赖） -------------------------------
+pandas
+scipy
+
+# --- 外部命令行工具（不是 pip 包，需另行安装） -----------------------------
+# hmmer   (jackhmmer 3.3.2)  序列新颖性检索，论文二 Fig 2G / Fig 4F-G
+# tm-align (>=20210107)      结构新颖性 TM-score，论文一 Fig S2C / S3C
+# foldseek (v7d0c07f89a)     结构检索对照，论文二 App A.5.4
+# aria2c / wget              权重与数据下载

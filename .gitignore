@@ -1,0 +1,38 @@
+# tensor dumps
+*.pt
+# Compiler Output #
+###################
+*.py[cod]
+*.so
+*.o
+*.exe
+*.class
+
+# Folders #
+###########
+bin/
+build/
+dist/
+local/
+tmp/
+__pycache__/
+*.egg-info/
+.idea/
+.ipynb_checkpoints/
+.vscode/
+esm/dev
+
+# nmf 实验产物（分解检查点、评估报告、曲线图）
+nmf/outputs/
+
+# 沙箱/桌面环境的回收站残留
+.Trash-*/
+
+# Junk #
+########
+.DS_Store*
+.*.swp
+*.swp
+*.log
+*~
+data/raw/swissprot_reviewed.fasta

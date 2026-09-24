@@ -1,0 +1,1 @@
+task,tag,n,length_mean,ppl_mean,ppl_median,ppl_min,oracle_rmsd_mean,oracle_rmsd_median,final_loss_mean,seconds_mean

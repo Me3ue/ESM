@@ -1,0 +1,23 @@
+{
+  "_comment": "论文《A high-level programming language for generative protein design》Methods A.3.4 的五个功能位点。start/end 为论文给出的闭区间残基号；design_programs.py --start/--end 用的是 [start, end) 半开区间，故 end 需 +1。",
+  "sites": [
+    {"name": "il10", "pdb_id": "1y6k", "chain": "L", "residues_inclusive": ["31-40"],
+     "note": "IL-10R1 结合位点"},
+    {"name": "ace2", "pdb_id": "6m0j", "chain": "A", "residues_inclusive": ["5-23"],
+     "note": "SARS-CoV-2 spike RBD 与 ACE2 的结合面；仓库自带 programs/functional_site_scaffolding.py 用的是 23-42 另一切法"},
+    {"name": "c3d",  "pdb_id": "1ghq", "chain": "A", "residues_inclusive": ["104-126", "170-184"],
+     "note": "补体受体 2 的 C3d 结合位点，两段不连续"},
+    {"name": "ha2",  "pdb_id": "5jw3", "chain": "B", "residues_inclusive": ["14-21", "33-42", "45-49"],
+     "note": "流感 HA2 表位（抗体 MEDI8825）"},
+    {"name": "rbd",  "pdb_id": "7mmo", "chain": "C", "residues_inclusive": ["439-450", "498-506"],
+     "note": "SARS-CoV-2 RBD 表位（抗体 bebtelovimab）"}
+  ],
+  "p1_backbone_targets": ["1QYS", "5L33", "6D0T", "6MRS", "6W3W", "6WVS"],
+  "_p2_note": "论文 App A.1.1 列了 39 个 de novo target，但其中 6DKM A / 6DKM B / 6DLM A / 6DLM B 是 4 个「PDB ID + 链」条目，对应 2 个 PDB 文件。所以去重后只需下载 37 个 PDB，取链由各自的 loader 决定。",
+  "p2_de_novo_targets": ["1QYS","2KL8","2KPO","2LN3","2LTA","2LVB","2N2T","2N2U","2N3Z","2N76",
+    "4KY3","4KYZ","5CW9","5KPE","5KPH","5L33","5TPJ","5TRV","6CZG","6CZH",
+    "6CZI","6CZJ","6D0T","6DG6","6DKM","6DLM","6E5C","6LLQ","6MRR","6MRS",
+    "6MSP","6NUK","6W3F","6W3W","6WI5","6WVS","7MCD"],
+  "p2_de_novo_targets_count_in_paper": 39,
+  "p2_de_novo_targets_unique_pdb": 37
+}

@@ -1,0 +1,82 @@
+{
+  "source": "swissprot",
+  "raw_file": "/home/zzj/protein/esm/data/raw/swissprot_reviewed.fasta",
+  "raw_file_sha256": "7fc51a4c63cbe8b9e366c03ea887c16d75225b299cfba503bfff5a74e68c25b6",
+  "query": "(reviewed:true) AND (fragment:false) AND (length:[50 TO 1022])",
+  "quality_control": {
+    "input": 524874,
+    "nonstandard": 1497,
+    "too_short": 0,
+    "too_long": 0,
+    "duplicate": 83656,
+    "kept": 439721
+  },
+  "decontamination": {
+    "train_before": 30000,
+    "removed": 876,
+    "train_after": 29124,
+    "k": 6,
+    "threshold": 0.6,
+    "max_guard_kmers": 1015
+  },
+  "args": {
+    "source": "swissprot",
+    "raw_file": "data/raw/swissprot_reviewed.fasta",
+    "query": "(reviewed:true) AND (fragment:false) AND (length:[50 TO 1022])",
+    "out_dir": "data/processed/swissprot",
+    "min_len": 50,
+    "max_len": 1022,
+    "train": 30000,
+    "valid": 2000,
+    "test": 4000,
+    "seed": 0,
+    "decontaminate": true,
+    "decontam_threshold": 0.6,
+    "kmer": 6,
+    "stats": null
+  },
+  "splits": {
+    "train": {
+      "path": "/home/zzj/protein/esm/data/processed/swissprot/train.fasta",
+      "sha256": "217c6f955a5b2365302592020f7136dd0fa42ec5a81f2f87d0c6795c51c47c32",
+      "length": {
+        "n": 29124,
+        "min": 50,
+        "p5": 89,
+        "p50": 312,
+        "p95": 760,
+        "max": 1022,
+        "mean": 346.3,
+        "total_residues": 10085760
+      }
+    },
+    "valid": {
+      "path": "/home/zzj/protein/esm/data/processed/swissprot/valid.fasta",
+      "sha256": "a961cec9a246acdd77385820c01c9b5114969eddd0b64beca9e24531a35d3e82",
+      "length": {
+        "n": 2000,
+        "min": 50,
+        "p5": 90,
+        "p50": 315,
+        "p95": 745,
+        "max": 1019,
+        "mean": 349.0,
+        "total_residues": 697974
+      }
+    },
+    "test": {
+      "path": "/home/zzj/protein/esm/data/processed/swissprot/test.fasta",
+      "sha256": "c4b0a3cb161c03e93642533201f376cd959824f3011c50a452f0ef23189f1539",
+      "length": {
+        "n": 4000,
+        "min": 50,
+        "p5": 89,
+        "p50": 310,
+        "p95": 739,
+        "max": 1020,
+        "mean": 342.4,
+        "total_residues": 1369602
+      }
+    }
+  }
+}
