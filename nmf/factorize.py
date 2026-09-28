@@ -62,7 +62,10 @@ def parse_args(argv=None):
     parser.add_argument("--init", choices=["nndsvd", "random"], default="nndsvd",
                         help="非负初始化方式")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", default="cpu", help="cpu / cuda / auto")
+    parser.add_argument("--device", default="cpu",
+                        help="cpu / cuda / auto。注意：HALS 求解器对每个因子逐列/逐行更新，"
+                             "内含 Python 循环与频繁 CPU 同步，在 GPU 上未必比 CPU 快；"
+                             "这是一次性离线成本，用 cpu 也完全可以")
     parser.add_argument("--out", default="nmf/outputs/nmf_factors.pt", help="分解结果保存路径")
     parser.add_argument("--report", default=None, help="分解报告 JSON 保存路径")
     parser.add_argument("--plot", action="store_true", help="保存乘性更新收敛曲线")
@@ -87,9 +90,9 @@ def main(argv=None) -> None:
     if args.rank is not None and args.rank_ratio is not None:
         raise SystemExit("--rank 与 --rank-ratio 只能指定一个。")
 
-    # 先加载模型以解析出具体的层名
+    # 先加载模型以解析出具体的层名（并搬到目标设备：--device 会被真正使用）
     model, alphabet = load_esm2(args.model, hub_dir=args.hub_dir)
-    model.eval()
+    model = model.eval().to(device)
     freeze_all(model)
     from .esm_common import resolve_layer_names
 

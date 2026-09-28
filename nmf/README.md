@@ -28,12 +28,67 @@ conda activate ESM
 ```bash
 conda create -y -n ESM python=3.10 pip
 conda run -n ESM pip install torch --index-url https://download.pytorch.org/whl/cpu
-conda run -n ESM pip install -e .
+conda run -n ESM pip install -e . --no-deps   # --no-deps：跳过上游 openfold 等重依赖
+conda run -n ESM pip install matplotlib pytest
 ```
 
-> 需要在 GPU 上跑（特别是 650M/3B 模型）时，把上面的 torch 换成 CUDA 版本即可，
-> 脚本本身通过 `--device auto` 自动选择设备。
-> 本机 `/tmp` 只有 10 MB，`pip` 下载大轮子前需 `export TMPDIR=/home/zzj/tmp`。
+> **换机器 / 换设备都不用改脚本**：三个脚本都通过 `nmf/_env.sh` 自动解析解释器（用当前激活
+> 环境里的 `python`，或 `PY=/path/to/python` 指定）、计算设备（`DEVICE`，默认 `auto`）和
+> `TMPDIR`（默认 `<仓库>/.tmp`，避免 `/tmp` 是小容量 tmpfs）。
+
+### 0.0 在 GPU 服务器上跑（例如 3090 / 24GB）
+
+```bash
+# 1) 建环境（CUDA 版 torch；3090 是 sm_86，cu118/cu121/cu124 的官方轮子都支持）
+conda create -y -n esm-nmf python=3.10 pip
+conda activate esm-nmf
+pip install torch --index-url https://download.pytorch.org/whl/cu121   # 显卡驱动需 >= 525
+pip install -e /path/to/esm --no-deps        # --no-deps 很重要：上游 requirements 里有 openfold 等重依赖
+pip install matplotlib pytest
+
+# 2) 自检（必须看到 cuda 可用 = True 与 GPU 名字）
+python -c "import torch;print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+nvidia-smi
+```
+
+如果 `torch.cuda.is_available()` 是 False，说明装成了 CPU 版轮子或驱动版本不匹配；
+`nmf/run_matrix.sh` 启动时会自动检测并**明确警告 + 回退到 CPU**，不会静默变慢。
+
+```bash
+# 3) 拷数据（服务器能上外网时可跳过，直接跑 prepare_data 下载）
+#    已切分好的 processed 只有 13 MB，比 236 MB 的原始 FASTA 划算得多
+rsync -avP data/processed user@server:/path/to/esm/data/
+
+# 4) 跑实验：DEVICE=auto 会在有 CUDA 时自动用 GPU
+export TMPDIR=$HOME/tmp            # 若服务器 /tmp 较小
+cd /path/to/esm
+DEVICE=cuda bash nmf/run_matrix.sh 2>&1 | tee nmf/outputs/fullmodel/matrix_gpu.log
+```
+
+**GPU 上各阶段的收益不一样，别期待线性加速**：
+
+| 阶段 | GPU vs CPU | 说明 |
+| --- | --- | --- |
+| 训练（`nmf.train_nmf`） | **明显更快**（本机 CPU 3.54 s/步） | 主要吃 forward+backward，3090 上预计提速 10~20×；因此可以把 `MAX_RECORDS` 提到全部 29,124 条、`EPOCHS` 2~3 |
+| 论文级评测（`nmf.benchmark`） | 明显更快 | 伪困惑度是大量小批量前向，GPU 收益大；可把 `N_EVAL` 提到 256、`PPL_RECORDS` 提到 16 |
+| **分解（`nmf.factorize`）** | **未必更快** | HALS 对每个因子逐列/逐行更新，是 Python 循环 + 每个子问题一次 CPU 同步，`rank=320` 时一次外循环有上千次小 kernel 与同步，GPU 利用率极低。这是一次性离线成本（8M 模型约 30 分钟），**建议保持 `--device cpu`**（`FACTORIZE_DEVICE=cpu`），或至少和 GPU 版对比一次耗时再定 |
+
+其他注意事项：
+
+- 随机数全部在 CPU 上用固定 seed 生成后搬运到设备（初始化、MLM 遮挡位置），因此
+  **同一 seed 在 CPU 与 GPU 上得到相同的初值与遮挡位置**，两边的指标可以直接对比；
+- 显存需求很小：8M 模型训练时 batch tokens ≤ 4096，3090 上占用 < 2 GB。换
+  `MODEL=esm2_t33_650M_UR50D` 时约 2.6 GB 权重 + 激活，24 GB 完全够；
+- **但 650M 模型的分解要谨慎**：`layers.N.fc1` 是 5120×1280，满阶 `rank=1280`，
+  HALS 的 Python 循环会变成主要瓶颈（比 8M 慢一个数量级以上）。建议
+  `--rank-ratio 0.25 --iters 200`，或先用 `--layers first,middle,last` 只分解少量层试水；
+- 权重首次加载会下载到 `~/.cache/torch/hub/checkpoints`（8M 约 29 MB）。服务器无外网时，
+  把本地这个目录整体拷过去即可；
+- 检查点里只存张量/字符串/数字，`load_checkpoint` 已兼容 `weights_only=True`，
+  所以**在不同 torch 版本的机器之间互相搬运检查点没问题**。
+
+**本机（开发机）的特殊之处**：`/tmp` 只有 10 MB tmpfs，`pip` 装大轮子前需
+`export TMPDIR=/home/zzj/tmp`；环境 `ESM` 里是 CPU 版 torch。这些不影响服务器上的流程。
 
 ## 0.1 数据准备（`nmf.prepare_data`）
 
@@ -510,6 +565,7 @@ nmf/
   evaluate.py         阶段 3 CLI：快速对比诊断
   benchmark.py        阶段 4 CLI：论文级评测（伪困惑度、CKA、mean±std）+ 断点续跑/重渲染
   summarize.py        纯后处理：把各阶段产物汇总成 SUMMARY.md / SUMMARY.json / layer_metrics.csv
+  _env.sh             公共环境准备（解释器/DEVICE/TMPDIR），三个 run_*.sh 共同 source
   run_all.sh          快速小样例：分解 → 训练 → 对比
   run_full_experiment.sh   完整严谨实验（单个 tag）：数据准备 → 全模型分解 → 训练 → 论文级评测
   run_matrix.sh       完整实验矩阵（{满阶,半秩}×{未训练,训练后}）+ 指标汇总，自动跳过已完成项
@@ -526,7 +582,7 @@ data/
 ## 6. 测试
 
 ```bash
-pytest tests/test_nmf.py -v      # 44 个用例，纯随机张量/小模型，无需下载权重，约 5 秒
+pytest tests/test_nmf.py -v      # 47 个用例，纯随机张量/小模型，无需下载权重，约 6 秒
 ```
 
 覆盖：形状/非负约束/中间为方阵、HALS 逼近满阶精确解、HALS 优于乘性更新、迭代确实降低误差、

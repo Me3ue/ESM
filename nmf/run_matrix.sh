@@ -7,6 +7,8 @@
 #
 # 常用环境变量（全部可选）：
 #   DRY_RUN=1                只打印将要执行的命令，不真正跑
+#   DEVICE=cuda              计算设备（默认 auto：有 CUDA 就用 GPU）；分解阶段可用
+#                            FACTORIZE_DEVICE 单独指定（HALS 未必适合 GPU）
 #   TAGS="fullrank"          只跑某个 tag（默认 "fullrank halfrank"）
 #   OUTDIR=...               产物目录（默认 nmf/outputs/fullmodel）
 #   FORCE_DATA=1 FORCE_FACTORIZE=1 FORCE_TRAIN=1 FORCE_BENCH=1   强制重跑对应阶段
@@ -21,7 +23,9 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-PY="${PY:-/home/zzj/anaconda3/envs/ESM/bin/python}"
+# shellcheck source=nmf/_env.sh
+source "$REPO_ROOT/nmf/_env.sh"
+
 MODEL="${MODEL:-esm2_t6_8M_UR50D}"
 DATA_DIR="${DATA_DIR:-data/processed/swissprot}"
 RAW_FILE="${RAW_FILE:-data/raw/swissprot_reviewed.fasta}"
@@ -56,8 +60,7 @@ FORCE_TRAIN="${FORCE_TRAIN:-0}"
 FORCE_BENCH="${FORCE_BENCH:-0}"
 
 mkdir -p "$OUTDIR" "$LOG_DIR"
-export HOME="${HOME:-/home/zzj}" TMPDIR="${TMPDIR:-/home/zzj/tmp}"
-unset PYTHONPATH
+nmf_check_device
 
 # 每个 tag 的分解超参：满阶用 RANK_RATIO=1.0，半秩用 0.5
 rank_ratio_of() { case "$1" in halfrank) echo "${HALFRANK_RANK_RATIO:-0.5}";; *) echo "${FULLRANK_RANK_RATIO:-1.0}";; esac; }
@@ -79,7 +82,6 @@ banner() {
 }
 
 banner "配置"
-echo " python      : $PY"
 echo " model       : $MODEL"
 echo " data        : $DATA_DIR    （已有 stats.json 则跳过数据准备）"
 echo " 产物目录    : $OUTDIR"
@@ -87,6 +89,7 @@ echo " 评测目录    : $BENCH_DIR"
 echo " tags        : $TAGS"
 echo " 评测规模    : n-eval=$N_EVAL  mask-rounds=$MASK_ROUNDS  ppl=$PPL_RECORDS×$PPL_MAX_LEN"
 echo " 训练规模    : epochs=$EPOCHS records=$MAX_RECORDS batch=$BATCH_SIZE lr=$LR trust-region=$MAX_RECON_DEG"
+echo " device      : $DEVICE（分解用 $FACTORIZE_DEVICE）  TMPDIR=$TMPDIR"
 [ "$DRY_RUN" = "1" ] && echo " >>> DRY_RUN 模式：只打印命令 <<<"
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +118,7 @@ for TAG in $TAGS; do
     --rank-ratio "$RANK_RATIO" \
     --solver hals --iters "$ITERS" --n-inner 20 \
     --shift min --init nndsvd \
+    --device "$FACTORIZE_DEVICE" \
     --out    "$OUTDIR/factors_${TAG}.pt" \
     --report "$OUTDIR/factor_report_${TAG}.json" \
     2>&1 | tee "$LOG_DIR/factorize_${TAG}.log"
@@ -142,7 +146,7 @@ for TAG in $TAGS; do
     --distill-weight "$DISTILL_W" --recon-weight "$RECON_W" --ce-weight 0.0 \
     --max-recon-degradation "$MAX_RECON_DEG" --rollback-tries 3 --grad-clip 1.0 \
     --eval-every "$EVAL_EVERY" --eval-fasta "$DATA_DIR/valid.fasta" --eval-records 32 \
-    --save-every "$SAVE_EVERY" --seed 0 --device cpu \
+    --save-every "$SAVE_EVERY" --seed 0 --device "$DEVICE" \
     --out     "$OUTDIR/trained_${TAG}.pt" \
     --history "$OUTDIR/history_${TAG}.json" \
     --csv     "$OUTDIR/history_${TAG}.csv" \
@@ -178,7 +182,7 @@ else
     --fasta "$DATA_DIR/test.fasta" --n-eval "$N_EVAL" --seq-max-len 1022 \
     --mask-frac 0.15 --mask-rounds "$MASK_ROUNDS" \
     --ppl-records "$PPL_RECORDS" --ppl-max-len "$PPL_MAX_LEN" --ppl-batch 32 \
-    --seed 0 --device cpu \
+    --seed 0 --device "$DEVICE" \
     --out-dir "$BENCH_DIR" --plot \
     2>&1 | tee "$LOG_DIR/benchmark.log"
   BENCH_RC=$?

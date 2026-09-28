@@ -26,6 +26,8 @@ from nmf.esm_common import (
 from nmf.nmf_layers import (
     ThreeFactorNMFLinear,
     factorize_matrix,
+    init_nndsvd,
+    init_random_nonnegative,
     make_shift,
     relative_frobenius_error,
     replace_linears_with_nmf,
@@ -843,3 +845,64 @@ def test_summarize_render_without_benchmark(tmp_path):
     assert "未找到任何分解报告" in text
     assert "未找到任何训练历史" in text
     assert "未找到" in text and "benchmark.json" in text
+
+
+# --------------------------------------------------------------------------- #
+# 设备安全（GPU 支持）
+#
+# 这几条断言在纯 CPU 的机器上也能通过，但真正的价值是在装了 CUDA 的机器上跑同一套测试：
+# 任何把中间张量硬编码成 CPU 的改动都会立刻暴露 —— 那正是 `--device cuda` 曾经直接崩溃的原因。
+# --------------------------------------------------------------------------- #
+def test_all_intermediate_tensors_follow_input_device():
+    W = _random_weight(out_features=12, in_features=8)   # float32
+    assert W.dtype == torch.float32
+
+    for mode in ("min", "row", "zero"):
+        W_target, offset = make_shift(W, mode)
+        assert W_target.device == W.device and offset.device == W.device
+        assert W_target.dtype == W.dtype and offset.dtype == W.dtype
+
+    _, offset = make_shift(W.abs(), "none")               # none 要求非负
+    assert offset.device == W.device and offset.dtype == W.dtype
+
+    A, S, B = init_nndsvd(W, rank=8)
+    for t in (A, S, B):
+        assert t.device == W.device and t.dtype == W.dtype
+
+    A, S, B = init_random_nonnegative(
+        12, 8, 8, 0.1,
+        generator=torch.Generator().manual_seed(0),
+        device=W.device, dtype=W.dtype,
+    )
+    for t in (A, S, B):
+        assert t.device == W.device and t.dtype == W.dtype
+
+
+def test_factorize_matrix_returns_tensors_on_input_device():
+    W = _random_weight(out_features=12, in_features=8)
+    A, S, B, offset, _ = factorize_matrix(W, rank=6, solver="hals", n_iter=2)
+    for t in (A, S, B, offset):
+        assert t.device == W.device
+    # 满阶 + min 平移时 rank 取 min(in,out)，S 必须是方阵
+    A, S, B, offset, info = factorize_matrix(W, solver="hals", n_iter=2)
+    assert S.shape == (info["rank"], info["rank"])
+
+
+def test_apply_mlm_mask_is_device_agnostic_and_reproducible():
+    """遮挡位置由 CPU 生成器决定再搬到 tokens 所在设备 → 换设备不改变结果、同 seed 可复现。"""
+    from nmf.esm_common import apply_mlm_mask
+
+    class _Alphabet:
+        cls_idx, eos_idx, padding_idx, mask_idx = 0, 1, 2, 3
+
+    tokens = torch.randint(4, 30, (4, 16))
+    masked_a, pos_a = apply_mlm_mask(tokens, _Alphabet(), 0.3, torch.Generator().manual_seed(7))
+    masked_b, pos_b = apply_mlm_mask(tokens, _Alphabet(), 0.3, torch.Generator().manual_seed(7))
+
+    assert torch.equal(pos_a, pos_b) and torch.equal(masked_a, masked_b)
+    assert masked_a.device == tokens.device and pos_a.device == tokens.device
+    assert int(pos_a.sum()) > 0
+    # 每条序列至少遮挡一个位置
+    assert (pos_a.sum(dim=1) > 0).all()
+    # 特殊 token 不会被遮挡
+    assert not bool(pos_a[0, 0])

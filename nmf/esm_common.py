@@ -235,9 +235,17 @@ def apply_mlm_mask(
     """按 ESM 预训练的方式随机遮挡残基，返回 ``(masked_tokens, mask_positions)``。
 
     ``mask_positions`` 为布尔张量，标记被遮挡（需要预测）的位置。
+
+    随机数固定用 **CPU 生成器** 生成（``generator`` 就是 CPU 生成器），再搬到
+    ``tokens`` 所在设备。这样做有两个原因：
+
+    1. ``torch.rand(..., generator=<CPU generator>, device='cuda')`` 会直接报
+       ``Expected a 'cuda' device type for generator but found 'cpu'``；
+    2. 同一 seed 在 CPU 与 GPU 上得到**完全相同的遮挡位置**，两个设备上的评测结果
+       因此可以直接对比。
     """
     eligible = non_special_mask(tokens, alphabet)
-    rand = torch.rand(tokens.shape, generator=generator)
+    rand = torch.rand(tokens.shape, generator=generator).to(tokens.device)
     mask_positions = eligible & (rand < mask_frac)
     # 保证每条序列至少遮挡一个位置（长度 > 1 时）
     empty_rows = mask_positions.sum(dim=1) == 0
@@ -245,7 +253,8 @@ def apply_mlm_mask(
         for row in torch.nonzero(empty_rows, as_tuple=False).flatten().tolist():
             valid = torch.nonzero(eligible[row], as_tuple=False).flatten()
             if valid.numel() > 0:
-                mask_positions[row, valid[torch.randint(valid.numel(), (1,), generator=generator).item()]] = True
+                pick = int(torch.randint(valid.numel(), (1,), generator=generator).item())
+                mask_positions[row, valid[pick]] = True
     masked_tokens = tokens.clone()
     masked_tokens[mask_positions] = alphabet.mask_idx
     return masked_tokens, mask_positions

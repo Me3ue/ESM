@@ -121,7 +121,7 @@ data/                         实验数据（本仓库新增）
   raw/                        原始下载（Swiss-Prot reviewed fasta，约 236 MB）
   processed/<名称>/           train/valid/test.fasta 与 stats.json（含 sha256）
 tests/                        模型、字母表、逆折叠、README/Notebook 一致性测试，
-                              test_nmf.py 为非负分解实验的单元测试（44 个用例，秒级）
+                              test_nmf.py 为非负分解实验的单元测试（47 个用例，秒级）
 hubconf.py                    PyTorch Hub 入口
 setup.py                      包配置及 CLI 注册（已把 nmf 一并打包）
 pyproject.toml / .flake8      构建与代码风格配置
@@ -514,12 +514,12 @@ aria2c --dir data/atlas --input-file scripts/atlas/v2023_02/full/tarballs.txt
 
 ```bash
 pytest                          # 全部测试
-pytest tests/test_nmf.py -v     # 只跑非负分解实验的单元测试（44 个用例，无需下载权重，约 5 秒）
+pytest tests/test_nmf.py -v     # 只跑非负分解实验的单元测试（47 个用例，无需下载权重，约 6 秒）
 ```
 
 `tests/test_nmf.py` 覆盖形状/非负约束/方阵、迭代确实降低误差、降秩确实变差、平移模式、
 前向等价性、bias 保留、层名解析、可训练参数范围、检查点往返，以及评测口径指纹/逐变体落盘/
-无模型渲染报告、指标汇总各节渲染等 44 个用例。
+无模型渲染报告、指标汇总各节渲染、设备安全不变式等 47 个用例。
 
 `tests/test_load_all.py` 会加载很多预训练模型，可能触发大量下载并占用资源；
 `tests/test_notebooks.py` / `tests/test_readme.py` 会执行 Notebook 与 README 中的片段，
@@ -679,6 +679,11 @@ python -m nmf.summarize --root nmf/outputs/fullmodel \
 ```
 
 `DRY_RUN=1 bash nmf/run_matrix.sh` 可以先看它会做什么。
+
+**在 GPU 服务器上跑**（例如 3090）：建 CUDA 版 torch 的 conda 环境后加 `DEVICE=cuda` 即可，
+三个脚本会自动解析解释器与设备；分解阶段建议仍用 CPU（HALS 含 Python 循环，GPU 收益很小），
+即 `FACTORIZE_DEVICE=cpu`。完整步骤、各阶段预期加速比、显存与数据搬运注意事项见
+`nmf/README.md` 第 0.0 节。
 
 ### 11.5 训练细节（含一个关键的稳定性陷阱）
 

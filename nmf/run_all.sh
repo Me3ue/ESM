@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 一键跑通：三因子非负分解 -> 批次训练 -> 与原模型对比
 #
-#   bash nmf/run_all.sh                          # 使用 conda 环境 ESM 的 python
+#   bash nmf/run_all.sh                          # 用当前激活环境里的 python
 #   PY=/path/to/python bash nmf/run_all.sh       # 指定解释器
+#   DEVICE=cuda bash nmf/run_all.sh              # 用 GPU（auto 会自动判断）
 #   RANK_RATIO=1.0 bash nmf/run_all.sh           # 满阶方阵（几乎无压缩）
 #   LAYERS="layers.5.fc1,layers.5.self_attn.out_proj" bash nmf/run_all.sh
 #
@@ -12,7 +13,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-PY="${PY:-/home/zzj/anaconda3/envs/ESM/bin/python}"
+# shellcheck source=nmf/_env.sh
+source "$REPO_ROOT/nmf/_env.sh"
+
 MODEL="${MODEL:-esm2_t6_8M_UR50D}"
 LAYERS="${LAYERS:-layers.5.fc1}"
 RANK_RATIO="${RANK_RATIO:-0.5}"          # 1.0 = 满阶方阵；0.5 = 中间方阵降一半秩
@@ -28,14 +31,16 @@ LR="${LR:-3e-3}"
 OUTDIR="${OUTDIR:-nmf/outputs}"
 
 mkdir -p "$OUTDIR"
+nmf_check_device
 
 echo "=============================================================="
-echo " python       : $PY"
 echo " model        : $MODEL"
 echo " layers       : $LAYERS  (rank-ratio=$RANK_RATIO, solver=$SOLVER, shift=$SHIFT)"
 echo " train fasta  : $TRAIN_FASTA  (max-records=$MAX_RECORDS, batch=$BATCH_SIZE, batches=$MAX_BATCHES, lr=$LR)"
 echo " eval  fasta  : $EVAL_FASTA"
 echo " output dir   : $OUTDIR"
+echo " device       : $DEVICE（分解用 $FACTORIZE_DEVICE）"
+nmf_env_report
 echo "=============================================================="
 
 echo
@@ -45,6 +50,7 @@ echo "### 1/3 三因子非负分解（W ≈ A S B + offset，A/S/B >= 0，S 为�
   --layers "$LAYERS" \
   --rank-ratio "$RANK_RATIO" \
   --solver "$SOLVER" --iters "$ITERS" --shift "$SHIFT" \
+  --device "$FACTORIZE_DEVICE" \
   --out    "$OUTDIR/nmf_factors.pt" \
   --report "$OUTDIR/factorize_report.json" \
   --plot
@@ -60,6 +66,7 @@ echo "### 2/3 批次训练（每步投影回非负象限，只训练 A/S/B）"
   --lr "$LR" --temperature 2.0 --mask-frac 0.15 \
   --distill-weight 1.0 --recon-weight 0.5 \
   --max-recon-degradation 0.3 \
+  --device "$DEVICE" \
   --eval-every 5 --eval-fasta "$EVAL_FASTA" --eval-records 8 \
   --out     "$OUTDIR/nmf_trained.pt" \
   --history "$OUTDIR/nmf_history.json" \
@@ -74,7 +81,7 @@ echo "--- (a) 同分布留出集：P62593 的另一批序列（不同随机种�
   --checkpoint "$OUTDIR/nmf_factors.pt" "$OUTDIR/nmf_trained.pt" \
   --names 未训练 训练后 \
   --fasta "$TRAIN_FASTA" --max-records "${EVAL_N:-8}" --seed 12345 \
-  --mask-frac 0.15 --mask-rounds 3 \
+  --mask-frac 0.15 --mask-rounds 3 --device "$DEVICE" \
   --out-dir "$OUTDIR/eval_indist"
 
 echo
@@ -84,7 +91,7 @@ echo "--- (b) 跨分布集：some_proteins（与训练集不同来源的多样�
   --checkpoint "$OUTDIR/nmf_factors.pt" "$OUTDIR/nmf_trained.pt" \
   --names 未训练 训练后 \
   --fasta "$EVAL_FASTA" --max-records 8 \
-  --mask-frac 0.15 --mask-rounds 3 \
+  --mask-frac 0.15 --mask-rounds 3 --device "$DEVICE" \
   --out-dir "$OUTDIR/eval_ood"
 
 echo

@@ -2,6 +2,8 @@
 # 论文级完整实验：数据准备 -> 全模型非负分解 -> 批次训练 -> 严格评测
 #
 #   bash nmf/run_full_experiment.sh
+#   DEVICE=cuda bash nmf/run_full_experiment.sh        # GPU（需要 CUDA 版 torch）
+#   TAG=halfrank RANK_RATIO=0.5 bash nmf/run_full_experiment.sh
 #
 # 可用环境变量覆盖（详见下方默认值）。产物写入 nmf/outputs/fullmodel/。
 set -euo pipefail
@@ -9,7 +11,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-PY="${PY:-/home/zzj/anaconda3/envs/ESM/bin/python}"
+# shellcheck source=nmf/_env.sh
+source "$REPO_ROOT/nmf/_env.sh"
+
 MODEL="${MODEL:-esm2_t6_8M_UR50D}"
 DATA_DIR="${DATA_DIR:-data/processed/swissprot}"
 RAW_FILE="${RAW_FILE:-data/raw/swissprot_reviewed.fasta}"
@@ -39,14 +43,16 @@ MAX_RECON_DEG="${MAX_RECON_DEG:-0.3}"
 
 mkdir -p "$OUTDIR"
 
+nmf_check_device
 echo "=============================================================="
-echo " python      : $PY"
 echo " model       : $MODEL"
 echo " data        : $DATA_DIR (train=$TRAIN_N valid=$VALID_N test=$TEST_N)"
 echo " 分解参数    : rank-ratio=$RANK_RATIO solver=hals iters=$ITERS shift=$SHIFT"
 echo " 训练参数    : epochs=$EPOCHS max-tokens/batch=$MAX_TOKENS lr=$LR kl-scope=$KL_SCOPE"
 echo "               distill=$DISTILL_W recon=$RECON_W trust-region=$MAX_RECON_DEG"
 echo " 输出        : $OUTDIR  (tag=$TAG)"
+echo " device      : $DEVICE（分解用 $FACTORIZE_DEVICE）"
+nmf_env_report
 echo "=============================================================="
 
 echo
@@ -63,6 +69,7 @@ echo "### 1/4 全模型非负分解（所有 38 个线性层）"
   --rank-ratio "$RANK_RATIO" \
   --solver hals --iters "$ITERS" --n-inner "$N_INNER" \
   --shift "$SHIFT" --init nndsvd \
+  --device "$FACTORIZE_DEVICE" \
   --out    "$OUTDIR/factors_${TAG}.pt" \
   --report "$OUTDIR/factor_report_${TAG}.json"
 
@@ -77,6 +84,7 @@ echo "### 2/4 批次训练（冻结其余参数，只训练 A/S/B/offset，信�
   --lr "$LR" --kl-scope "$KL_SCOPE" \
   --distill-weight "$DISTILL_W" --recon-weight "$RECON_W" --ce-weight 0.0 \
   --max-recon-degradation "$MAX_RECON_DEG" --rollback-tries 3 \
+  --device "$DEVICE" \
   --eval-every 25 --eval-fasta "$DATA_DIR/valid.fasta" --eval-records 32 \
   --out     "$OUTDIR/trained_${TAG}.pt" \
   --history "$OUTDIR/history_${TAG}.json" \
@@ -90,6 +98,7 @@ echo "### 3/4 严格评测（留出测试集；逐变体落盘，中断可续跑
   --fasta "$DATA_DIR/test.fasta" --n-eval 128 \
   --mask-frac 0.15 --mask-rounds 5 \
   --ppl-records 12 --ppl-max-len 256 --ppl-batch 32 \
+  --device "$DEVICE" \
   --out-dir "$OUTDIR/bench_${TAG}" --plot
 
 echo

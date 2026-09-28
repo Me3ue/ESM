@@ -107,12 +107,17 @@ def factored_param_count(a: torch.Tensor, s: torch.Tensor, b: torch.Tensor) -> i
 # 初始化
 # --------------------------------------------------------------------------- #
 def init_random_nonnegative(
-    out_features: int, in_features: int, rank: int, scale: float, generator=None
+    out_features: int, in_features: int, rank: int, scale: float,
+    generator=None, device=None, dtype=torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """随机非负初始化。"""
-    A = torch.rand((out_features, rank), generator=generator) * scale
-    S = torch.eye(rank) * scale
-    B = torch.rand((rank, in_features), generator=generator) * scale
+    """随机非负初始化。
+
+    ``generator`` 是 **CPU 生成器**：随机数先在 CPU 上生成再搬到 ``device``，
+    这样同一 seed 在 CPU 与 GPU 上会得到**完全相同的初值**，两边的结果可直接对比。
+    """
+    A = torch.rand((out_features, rank), generator=generator).to(device=device, dtype=dtype) * scale
+    S = (torch.eye(rank, dtype=dtype) * scale).to(device=device)
+    B = torch.rand((rank, in_features), generator=generator).to(device=device, dtype=dtype) * scale
     return A, S, B
 
 
@@ -124,28 +129,34 @@ def init_nndsvd(
     取 ``W`` 的前 ``rank`` 个奇异三元组，用 ``sqrt(sigma) * |u|`` 与
     ``sqrt(sigma) * |v|`` 作为 A、B 的初值，S 取单位阵。这样 ``A @ B`` 已经能
     粗略逼近 ``W``，后续迭代收敛更快。
+
+    所有中间张量都在 ``W`` 的**设备和 dtype 上**创建——这是能在 GPU 上跑通的前提：
+    早期版本固定创建 CPU 张量，``--device cuda`` 时会在与 ``W`` 运算时因设备不一致报错。
     """
     W = W.detach().float()
     m, n = W.shape
+    device, dtype = W.device, W.dtype
     W = W.clamp(min=0)
     k = min(rank, m, n)
     try:
         U, sv, Vh = torch.linalg.svd(W, full_matrices=False)
     except Exception:  # pragma: no cover - 极端数值问题
-        return init_random_nonnegative(m, n, rank, 1.0 / max(m, n))
+        return init_random_nonnegative(
+            m, n, rank, 1.0 / max(m, n), device=device, dtype=dtype
+        )
 
     U = U[:, :k]
     sv = sv[:k].clamp(min=eps)
     Vh = Vh[:k, :]
 
-    A = torch.zeros(m, rank)
-    B = torch.zeros(rank, n)
-    S = torch.eye(rank)
+    A = torch.zeros(m, rank, device=device, dtype=dtype)
+    B = torch.zeros(rank, n, device=device, dtype=dtype)
+    S = torch.eye(rank, device=device, dtype=dtype)
     A[:, :k] = U.abs() * sv.sqrt().unsqueeze(0)
     B[:k, :] = Vh.abs() * sv.sqrt().unsqueeze(1)
     if rank > k:
-        A[:, k:] = torch.rand(m, rank - k) * 1e-3
-        B[k:, :] = torch.rand(rank - k, n) * 1e-3
+        A[:, k:] = torch.rand(m, rank - k, device=device, dtype=dtype) * 1e-3
+        B[k:, :] = torch.rand(rank - k, n, device=device, dtype=dtype) * 1e-3
     return A.clamp(min=eps), S.clamp(min=eps), B.clamp(min=eps)
 
 
@@ -161,15 +172,19 @@ def make_shift(
     - ``row``  ：``offset_i = min_j W_ij``（逐输出维取最小）；
     - ``zero`` ：``offset = 0``，并把负元素截断为 0；
     - ``none`` ：不处理，要求 ``W`` 本身非负。
+
+    ``offset`` 一定建在 ``W`` 的设备上（``--device cuda`` 时用过 CPU 张量会在
+    ``W - offset`` 处因设备不一致报错）。
     """
     W = W.detach().float()
     out_features = W.shape[0]
+    device, dtype = W.device, W.dtype
     if mode == "row":
         offset = W.min(dim=1).values
     elif mode == "min":
-        offset = torch.full((out_features,), float(W.min().item()))
+        offset = torch.full((out_features,), float(W.min().item()), device=device, dtype=dtype)
     elif mode in {"zero", "none"}:
-        offset = torch.zeros(out_features)
+        offset = torch.zeros(out_features, device=device, dtype=dtype)
     else:
         raise ValueError(f"未知 shift 模式：{mode}")
 
@@ -458,6 +473,8 @@ def factorize_matrix(
 
     W_target, offset = make_shift(W, shift)
 
+    # 随机数一律在 CPU 上用固定 seed 生成再搬到目标设备：
+    # CPU/GPU 得到相同初值，跨设备结果可比、可复现。
     generator = torch.Generator().manual_seed(seed)
     if init == "nndsvd":
         A, S, B = init_nndsvd(W_target, rank)
@@ -465,9 +482,14 @@ def factorize_matrix(
         A, S, B = init_random_nonnegative(
             out_features, in_features, rank,
             scale=1.0 / math.sqrt(max(rank, 1)), generator=generator,
+            device=W_target.device, dtype=W_target.dtype,
         )
     else:
         raise ValueError(f"未知 init 模式：{init}")
+
+    # 兜底：保证三个因子与目标矩阵在同一设备上（GPU 上漏搬会直接报错）
+    device, dtype = W_target.device, W_target.dtype
+    A, S, B = A.to(device=device, dtype=dtype), S.to(device=device, dtype=dtype), B.to(device=device, dtype=dtype)
 
     if solver == "hals":
         A, S, B, info = hals_updates(
